@@ -318,4 +318,216 @@ ollama pull llava:latest
 
 ---
 
-That’s it—drop this in your repo as `README.md`. If you want me to tailor any step to macOS (client) or add a systemd unit for auto-starting the API on boot, say the word and I’ll include those blocks.
+How to add features or make changes
+1) Quick map of the codebase
+
+gateway/main.py – FastAPI server that exposes:
+
+POST /chat – sends your text to the chat model (Mistral by default)
+
+POST /vision – sends an image + a mode (scene | emotion | navigate | objects) to the vision model
+
+Auth is via Bearer token (the string in runtime/api_keys.txt)
+
+Models and host are set via environment variables at startup
+
+talkbot_gui.py – Windows/Qt GUI client:
+
+Camera preview + “Snap → Vision”
+
+Dropdown for Mode
+
+Local TTS (pyttsx3)
+
+Optional mic STT (SpeechRecognition + PyAudio)
+
+Sends requests to the VM gateway URL you paste into the app
+
+Tip: the server and GUI are loosely coupled over HTTP. You can evolve them independently: just keep the same endpoints and fields.
+
+2) Typical changes you might want
+A) Add a new Vision mode (server + GUI)
+
+Server (VM) – gateway/main.py
+
+In the existing /vision route, you’ll see logic that reads mode from the form/JSON and builds a prompt. Look for a mapping or if/elif that switches on mode.
+
+Add a new mode, e.g. count:
+
+# inside /vision handler, where prompt is built:
+mode = (mode or "scene").lower()
+
+if mode == "scene":
+    sys_hint = "Describe the scene briefly for navigation."
+elif mode == "emotion":
+    sys_hint = "Describe the likely facial expression and overall emotion."
+elif mode == "navigate":
+    target = (payload or {}).get("target") or (target or "")
+    sys_hint = f"How would you navigate toward {target or 'the target'}? Mention obstacles and directions."
+elif mode == "objects":
+    sys_hint = "List the main objects and their approximate positions (e.g., 'mug - bottom-right'). Keep it short."
+elif mode == "count":  # <--- NEW
+    sys_hint = "Count people and visible key objects. Return a compact list like 'people: N, chairs: M, screens: K'."
+else:
+    sys_hint = "Describe the scene briefly."
+
+
+No other server changes are required—your gateway will keep sending the image bytes to Ollama’s /api/chat with images:[<b64>].
+
+GUI (Windows) – talkbot_gui.py
+
+Add the mode to the dropdown and give it a default prompt:
+
+# 1) When building the UI:
+self.mode_combo.addItems(["scene", "emotion", "navigate", "objects", "count"])
+
+# 2) When deciding the default user prompt (in _vision_with_frame):
+user_prompt = prompt or {
+    "scene": "Describe the scene briefly for navigation.",
+    "emotion": "Describe the likely facial expression and overall emotion.",
+    "navigate": f"How to navigate toward {target or 'the target'} in the scene?",
+    "objects": "List the main objects present with short positions.",
+    "count": "Count people and visible key objects. Keep it compact.",  # NEW
+}.get((mode or "scene").lower(), "Describe the scene briefly for navigation.")
+
+
+Re-run the API and GUI; select count in the mode list and Snap → Vision.
+
+B) Add a new endpoint on the server (e.g., /summarize)
+
+Server
+
+# gateway/main.py
+from fastapi import FastAPI, Header, HTTPException
+api = FastAPI()
+
+@api.post("/summarize")
+async def summarize(payload: dict, authorization: str | None = Header(None)):
+    _require_key(authorization)  # same auth gate as others
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+    sys_prompt = "You are a concise summarizer. 3 bullets max."
+    summary = await ollama_chat(
+        CHAT_MODEL,
+        [{"role":"system","content":sys_prompt},
+         {"role":"user","content":text}]
+    )
+    return {"summary": summary}
+
+
+GUI (optional)
+Add a new button and handler that POSTs to /summarize with a text box’s content.
+
+C) Swap or pin models (server)
+
+When you start uvicorn, set the env vars:
+
+CHAT_MODEL="mistral:latest" \
+VISION_MODEL="llava:latest" \
+python -m uvicorn gateway.main:api --host 0.0.0.0 --port 8081 --reload
+
+
+Pull before switching:
+
+ollama pull llava:latest
+
+
+You can even add a fallback in your /vision code: if model A returns empty content, automatically retry with model B.
+
+D) Improve TTS reliability (GUI)
+
+The GUI already re-inits pyttsx3 per utterance. If you want a volume/rate slider:
+
+eng = pyttsx3.init()
+eng.setProperty("rate", 180)   # default ~200
+eng.setProperty("volume", 0.9) # 0.0 - 1.0
+
+
+Add sliders in the UI and store in Settings so users can tweak.
+
+E) Add wake-words, continuous listening, or STT to Vision
+
+The GUI already has mic → chat or mic → vision (select in the combo).
+
+To make Vision the default mic target, set the combo default to “vision”.
+
+For wake-word, you’d add a background thread listening and trigger _chat_from_mic().
+
+3) Dev loop (run & test quickly)
+Server (VM)
+cd ~/talkbot
+source .venv/bin/activate
+fuser -k 8081/tcp 2>/dev/null || true
+
+# Change models or keep defaults:
+CHAT_MODEL="mistral:latest" \
+VISION_MODEL="moondream:latest" \
+python -m uvicorn gateway.main:api --host 0.0.0.0 --port 8081 --reload
+
+
+Test:
+
+KEY="$(cat runtime/api_keys.txt)"
+
+# Chat
+curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"text":"hello"}' http://127.0.0.1:8081/chat | python -m json.tool
+
+# Vision (scene)
+curl -s -H "Authorization: Bearer $KEY" \
+  -F "image=@sample.jpg;type=image/jpeg" \
+  -F "mode=scene" http://127.0.0.1:8081/vision | python -m json.tool
+
+GUI (Windows)
+cd C:\path\to\repo
+. .\.venv\Scripts\Activate.ps1
+python .\talkbot_gui.py
+
+
+Paste the VM tunnel URL (or VM IP if reachable) and your API key, Save → Test.
+
+4) Coding style & structure
+
+Keep server logic small & focused in the route handlers.
+
+For bigger features, split helpers into a gateway/utils.py and import into main.py.
+
+Prefer async IO (already using httpx.AsyncClient).
+
+5) Version control & GitHub flow
+
+On the VM (or locally if you dev there):
+
+cd ~/talkbot
+git checkout -b feature/new-vision-mode
+# edit gateway/main.py and/or talkbot_gui.py
+
+git add -A
+git commit -m "feat(vision): add 'count' mode"
+git push -u origin feature/new-vision-mode
+
+
+Open a Pull Request on GitHub from feature/new-vision-mode → main.
+
+Secrets: runtime/api_keys.txt is already in .gitignore—never commit it.
+
+6) Releasing/Sharing
+
+Update the README if you add new modes/endpoints.
+
+If you change the GUI’s required packages, list them in a requirements-client.txt (optional).
+
+If you change the server’s dependencies, update gateway/requirements.txt.
+
+7) Common pitfalls (and fixes)
+
+403 Invalid API key: the GUI must use the exact string in runtime/api_keys.txt. Test / _authdebug.
+
+Empty Vision text: try a different model (llava:latest), or add a retry fallback in server code.
+
+Latency spikes: first call “warms” the model. Send a /health or trivial chat at startup.
+
+Tunnel stops working: start a fresh cloudflared session; the URL changes each time.
+
+Mic errors: you can run without STT. To enable, pip install SpeechRecognition PyAudio==0.2.14.
