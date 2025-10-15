@@ -1,0 +1,270 @@
+import os
+import json
+import base64
+from typing import Optional, Dict, Any, List
+
+import httpx
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Body, Request
+
+# ---------------- Env / Config ----------------
+
+OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+CHAT_MODEL  = os.getenv("CHAT_MODEL",  "mistral:latest")
+VISION_MODEL= os.getenv("VISION_MODEL","moondream2:latest")
+
+DATA_DIR    = os.getenv("TALKBOT_DATA_DIR", os.path.expanduser("~/talkbot/runtime"))
+API_KEYS_FN = os.getenv("API_KEYS_FILE", os.path.join(DATA_DIR, "api_keys.txt"))
+
+api = FastAPI(title="TalkBot Gateway", version="1.0.0")
+
+# ---------------- Auth ----------------
+
+def _load_keys() -> List[str]:
+    try:
+        with open(API_KEYS_FN, "r", encoding="utf-8") as f:
+            keys = [ln.strip() for ln in f if ln.strip()]
+        return keys
+    except Exception:
+        return []
+
+def _require_key(authorization: Optional[str]):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header (Bearer <key>)")
+    token = authorization.split(" ", 1)[1].strip()
+    keys = _load_keys()
+    if token not in keys:
+        raise HTTPException(status_code=403, detail=f"Invalid API key (loaded={len(keys)} from {API_KEYS_FN})")
+
+# ---------------- Health & Debug ----------------
+
+@api.get("/health")
+def health():
+    return {"ok": True}
+
+@api.get("/_authdebug")
+def authdebug(authorization: Optional[str] = Header(None)):
+    tok = ""
+    if authorization and authorization.startswith("Bearer "):
+        tok = authorization.split(" ", 1)[1].strip()
+    return {
+        "authorization": authorization,
+        "token_len": len(tok),
+        "token_prefix": tok[:8],
+        "token_suffix": tok[-8:],
+        "API_KEYS_FN": API_KEYS_FN,
+        "loaded_keys": len(_load_keys()),
+    }
+
+# ---------------- Ollama helpers ----------------
+
+async def ollama_generate(model: str, prompt: str, image_b64: Optional[str] = None) -> str:
+    """
+    Robust Ollama call:
+      - Prefer /api/generate
+      - On 404/405 or empty content, transparently fall back to /api/chat
+    Vision: pass base64 in 'images' for either endpoint.
+    """
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        # ---------- Attempt A: /api/generate ----------
+        try:
+            if image_b64:
+                payload = {
+                    "model": model,
+                    "prompt": prompt,
+                    "images": [image_b64],
+                    "stream": False,
+                }
+            else:
+                payload = {"model": model, "prompt": prompt, "stream": False}
+
+            r = await c.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            # Some setups return 404/405 here; let fallback handle those.
+            if r.status_code == 200:
+                j = r.json()
+                content = (j.get("response") or "").strip()
+                if content:
+                    return content
+            else:
+                # non-200 -> try fallback
+                pass
+        except Exception:
+            # network / parse -> try fallback
+            pass
+
+        # ---------- Attempt B: /api/chat ----------
+        try:
+            if image_b64:
+                # Vision via chat: images on user message
+                payload = {
+                    "model": model,
+                    "messages": [{
+                        "role": "user",
+                        "content": prompt,
+                        "images": [image_b64],
+                    }],
+                    "stream": False,
+                }
+            else:
+                # Text via chat: render simple user message
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "You are a concise helpful assistant."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                }
+
+            r = await c.post(f"{OLLAMA_URL}/api/chat", json=payload)
+            r.raise_for_status()
+            j = r.json()
+
+            # Common shapes:
+            #  - {"message":{"role":"assistant","content":"..."}, ...}
+            if isinstance(j, dict):
+                msg = j.get("message")
+                if isinstance(msg, dict):
+                    content = (msg.get("content") or "").strip()
+                    if content:
+                        return content
+                # Some adapters mimic OpenAI:
+                #  - {"choices":[{"message":{"content":"..."}}], ...}
+                ch = j.get("choices")
+                if isinstance(ch, list) and ch:
+                    content = (((ch[0] or {}).get("message") or {}).get("content") or "").strip()
+                    if content:
+                        return content
+            # last-ditch
+            return (j.get("response") or "").strip() if isinstance(j, dict) else ""
+        except Exception:
+            return ""
+
+async def ollama_chat_as_generate(model: str, messages: List[Dict[str, str]]) -> str:
+    prompt = _render_chat_messages_to_prompt(messages)
+    return await ollama_generate(model, prompt, image_b64=None)
+
+# ---------------- TTS stub ----------------
+
+def speak(_text: str, _voice_id: str) -> str:
+    """
+    Server-side audio not required here; GUI does TTS.
+    Return empty string to signal 'no server audio'.
+    """
+    return ""
+
+# ---------------- Chat ----------------
+
+
+@api.post("/chat")
+async def chat_endpoint(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    text = str(payload.get("text", "")).strip()
+    voice_id = str(payload.get("voice_id", "en_US-amy-medium"))
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+    # Mistral chat
+    sys_prompt = "You are a concise helpful assistant. Answer clearly."
+    assistant = await ollama_chat(CHAT_MODEL, [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": text}
+    ])
+    # IMPORTANT: do NOT try server-side TTS here; return empty audio_url so the client speaks locally.
+    audio_url = ""
+    return {"text": assistant, "audio_url": audio_url, "voice": voice_id}
+
+async def chat_endpoint(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    text = str(payload.get("text", "")).strip()
+    voice_id = str(payload.get("voice_id", "en_US-amy-medium"))
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+    # System prompt kept minimal; use generate-based chat
+    sys_prompt = "You are a concise, helpful assistant. Answer clearly."
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": text},
+    ]
+    assistant = await ollama_chat_as_generate(CHAT_MODEL, messages)
+    audio_url = speak(assistant, voice_id) if assistant else ""
+    return {"text": assistant, "audio_url": audio_url, "voice": voice_id}
+
+# ---------------- Vision ----------------
+
+def _vision_mode_hint(mode: str, target: str) -> str:
+    m = (mode or "scene").strip().lower()
+    if m == "emotion":
+        return "Describe the likely facial expression and overall emotion in the scene. Be careful and tentative."
+    if m == "navigate":
+        t = target or "the target"
+        return f"Help a visually impaired user navigate toward {t}. Mention obstacles and safe directions succinctly."
+    if m == "objects":
+        return "List the main objects you can see with very short positions (e.g., 'mug - bottom right')."
+    # default: scene
+    return "Describe the scene briefly for navigation; mention obstacles, walkable directions, and affordances."
+
+def _pick_text_prompt(user_prompt: str, mode: str, target: str) -> str:
+    user_prompt = (user_prompt or "").strip()
+    hint = _vision_mode_hint(mode, target)
+    return (user_prompt + "\n\n" if user_prompt else "") + hint
+
+@api.post("/vision")
+async def vision_endpoint(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    # multipart (GUI path)
+    image: UploadFile | None = File(None),
+    prompt: str | None = Form(None),
+    mode: str | None = Form(None),
+    target: str | None = Form(None),
+    voice_id: str | None = Form(None),
+    # raw JSON (programmatic)
+    payload: Dict[str, Any] | None = Body(None),
+):
+    _require_key(authorization)
+    import base64
+
+    # defaults
+    v_id = (voice_id or "en_US-amy-medium")
+    text_prompt = (prompt or "").strip()
+    md = (mode or "scene").strip().lower()
+    tgt = (target or "").strip()
+    img_b64 = None
+
+    # If JSON, override from payload
+    ctype = request.headers.get("content-type", "").lower()
+    if "application/json" in ctype:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        text_prompt = str(payload.get("prompt", text_prompt))
+        md = str(payload.get("mode", md))
+        tgt = str(payload.get("target", tgt))
+        v_id = str(payload.get("voice_id", v_id))
+        if payload.get("image_b64"):
+            img_b64 = str(payload["image_b64"])
+
+    # Multipart image path
+    if img_b64 is None and image is not None:
+        data = await image.read()
+        img_b64 = base64.b64encode(data).decode("ascii")
+
+    if not img_b64:
+        raise HTTPException(status_code=400, detail="image missing (multipart 'image' or JSON 'image_b64')")
+
+    q = _pick_text_prompt(text_prompt, md, tgt)
+
+    try:
+        result = await ollama_generate(VISION_MODEL, q, image_b64=img_b64)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"vision upstream error: {e}")
+
+    # GUI does TTS; return empty audio_url
+    audio_url = ""
+    try:
+        if result:
+            audio_url = speak(result, v_id)
+    except Exception:
+        audio_url = ""
+
+    return {"text": result or "", "audio_url": audio_url, "voice": v_id}

@@ -1,0 +1,167 @@
+import os, uuid, glob, base64, shlex, subprocess, io, json
+from typing import Optional, List, Set, Dict, Any
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+import httpx
+from PIL import Image
+
+# ---- Config ----
+AUDIO_DIR   = os.getenv("AUDIO_DIR", "/app/audio")
+API_KEYS_FN = os.getenv("API_KEYS_FILE", "/app/api_keys.txt")
+VOICES_DIR  = "/data"                          # piper .onnx voices live here
+OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://ollama:11434")
+
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# ---- Auth helpers ----
+def _load_keys() -> Set[str]:
+    keys: Set[str] = set()
+    try:
+        with open(API_KEYS_FN, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    keys.add(ln)
+    except FileNotFoundError:
+        pass
+    return keys
+
+def _require_key(authorization: Optional[str]) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    token = authorization.split(" ", 1)[1].strip()
+    if token not in _load_keys():
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+# ---- Voice helpers ----
+def _voice_files() -> Dict[str,str]:
+    voices: Dict[str,str] = {}
+    for p in glob.glob(os.path.join(VOICES_DIR, "*.onnx")):
+        vid = os.path.splitext(os.path.basename(p))[0]
+        voices[vid] = p
+    return voices
+
+def _piper_tts(text: str, voice_path: str, out_wav: str) -> None:
+    # We use the standalone piper binary & its runtime libs installed in the image
+    cmd = f'piper -m {shlex.quote(voice_path)} -f {shlex.quote(out_wav)}'
+    proc = subprocess.run(cmd, input=text.encode("utf-8"),
+                          shell=True, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def _espeak_tts(text: str, out_wav: str, voice: str="en-US", rate: int=165) -> None:
+    cmd = f'espeak-ng -v {shlex.quote(voice)} -s {rate} -w {shlex.quote(out_wav)} -- {shlex.quote(text)}'
+    subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def synth(text: str, voice_id: str) -> str:
+    """Return URL path to wav file."""
+    out = os.path.join(AUDIO_DIR, f"{uuid.uuid4()}.wav")
+    voices = _voice_files()
+    if voice_id in voices:
+        _piper_tts(text, voices[voice_id], out)
+    else:
+        # fallback to espeak voice if piper voice not present
+        _espeak_tts(text, out, voice="en-US")
+    return "/audio/" + os.path.basename(out)
+
+# ---- Ollama helpers ----
+async def ollama_chat(model: str, messages: List[Dict[str,Any]]) -> str:
+    url = f"{OLLAMA_URL}/api/chat"
+    payload = {"model": model, "messages": messages, "stream": False}
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(url, json=payload)
+        r.raise_for_status()
+        j = r.json()
+        return j.get("message", {}).get("content", "")
+
+async def ollama_generate(model: str, prompt: str, image_b64: Optional[str]=None) -> str:
+    url = f"{OLLAMA_URL}/api/generate"
+    payload: Dict[str,Any] = {"model": model, "prompt": prompt, "stream": False}
+    if image_b64:
+        payload["images"] = [image_b64]
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(url, json=payload)
+        r.raise_for_status()
+        j = r.json()
+        return j.get("response", "")
+
+def _img_to_b64(pil: Image.Image) -> str:
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+# ---- FastAPI app ----
+api = FastAPI()
+
+@api.get("/health")
+def health():
+    return {"ok": True}
+
+@api.get("/voices")
+def voices(authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    v = [{"id": vid, "name": vid} for vid in sorted(_voice_files().keys())]
+    return {"voices": v}
+
+@api.get("/audio/{name}")
+def audio(name: str):
+    path = os.path.join(AUDIO_DIR, os.path.basename(name))
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Not found")
+    return FileResponse(path, media_type="audio/wav")
+
+@api.post("/speak")
+def speak(body: Dict[str,Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    text = body.get("text","").strip()
+    voice_id = body.get("voice_id","")
+    if not text:
+        raise HTTPException(400, "text required")
+    try:
+        url = synth(text, voice_id or "en-US")
+        return {"audio_url": url, "voice": voice_id or "en-US"}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(500, f"TTS failed: {e}")
+
+# Natural language Q&A with Mistral
+@api.post("/nlq")
+async def nlq(body: Dict[str,Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    user = body.get("utterance","").strip()
+    if not user:
+        raise HTTPException(400, "utterance required")
+    system = "You are a helpful robotics assistant. Answer concisely."
+    content = await ollama_chat("mistral", [
+        {"role":"system","content":system},
+        {"role":"user","content":user},
+    ])
+    return {"answer": content}
+
+# Vision (Moondream) – image is uploaded as file OR frame_b64
+@api.post("/vision")
+async def vision(authorization: Optional[str] = Header(None),
+                 query: str = Form("Describe the scene for navigation."),
+                 file: Optional[UploadFile] = File(None),
+                 frame_b64: Optional[str] = Form(None)):
+    _require_key(authorization)
+    img_b64: Optional[str] = None
+    if file:
+        pil = Image.open(file.file).convert("RGB")
+        img_b64 = _img_to_b64(pil)
+    elif frame_b64:
+        img_b64 = frame_b64
+    else:
+        raise HTTPException(400, "image required")
+    prompt = f"Answer briefly. {query}"
+    try:
+        reply = await ollama_generate("moondream", prompt, image_b64=img_b64)
+    except httpx.HTTPError as e:
+        raise HTTPException(500, f"Ollama error: {e}")
+    return {"vision": reply}
+
+# Simple nav stub
+@api.post("/nav/goal")
+def nav_goal(body: Dict[str,Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    goal = body.get("goal","go to charging station")
+    waypoints = [[0.5,0.0,0.0],[0.5,1.0,1.57],[0.5,2.0,1.57]]
+    return {"goal": goal, "waypoints": waypoints, "note":"demo path; replace with planner"}
