@@ -1,0 +1,6 @@
+PyQt6>=6.6
+requests>=2.32.0
+opencv-python>=4.10.0.84
+numpy>=1.26
+sounddevice>=0.4.7
+vosk>=0.3.45
