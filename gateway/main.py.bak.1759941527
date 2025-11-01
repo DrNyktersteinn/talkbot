@@ -1,0 +1,204 @@
+
+import os
+import json
+import uuid
+import subprocess
+from typing import List, Optional, Dict, Any
+
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import httpx
+
+# --------------------
+# Config / Environment
+# --------------------
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+API_KEYS_FILE = os.getenv("API_KEYS_FILE", "/app/api_keys.txt")
+AUDIO_DIR = os.getenv("AUDIO_DIR", "/app/audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# Ensure espeak can find voice data shipped with Piper binary
+DEFAULT_ESPEAK_DATA = os.getenv("ESPEAKNG_DATA", "/opt/piper/espeak-ng-data")
+
+# --------------------
+# API Key Management
+# --------------------
+def _load_keys() -> set:
+    if not os.path.exists(API_KEYS_FILE):
+        return set()
+    return {line.strip() for line in open(API_KEYS_FILE, "r", encoding="utf-8") if line.strip()}
+
+API_KEYS = _load_keys()
+
+async def require_api_key(authorization: Optional[str]):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token not in API_KEYS:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+# --------------------
+# Pydantic Schemas
+# --------------------
+class VoiceSettings(BaseModel):
+    voice_id: str
+    speaking_rate: Optional[float] = 1.0
+    pitch: Optional[int] = 0
+
+class NLQRequest(BaseModel):
+    utterance: str
+    frame_b64: Optional[str] = None
+
+class NavGoalRequest(BaseModel):
+    goal: str
+
+class SpeakBody(BaseModel):
+    text: str
+    voice_id: Optional[str] = None
+
+# --------------------
+# App & In-memory store
+# --------------------
+api = FastAPI(title="TalkBot Gateway", version="0.1")
+USER_SETTINGS: Dict[str, Dict[str, Any]] = {}
+
+# Advertised voices (use Piper if /data/<id>.onnx exists; else espeak fallback)
+ADVERTISED_VOICES = [
+    {"id": "en_US-amy-low",   "name": "Amy (US)"},
+    {"id": "en_GB-sarah-low", "name": "Sarah (UK)"},
+    {"id": "en_AU-jack-low",  "name": "Jack (AU)"},
+]
+
+# Map to espeak language codes for fallback
+ESPEAK_MAP = {
+    "en_US-amy-low":   "en-US",
+    "en_GB-sarah-low": "en-GB",
+    "en_AU-jack-low":  "en-AU",
+}
+
+# --------------------
+# Helpers: TTS
+# --------------------
+def synth_with_espeak(text: str, voice_id: str) -> str:
+    """
+    Fallback TTS using espeak-ng (always available). We pin ESPEAKNG_DATA
+    to the directory bundled with Piper binaries so it can find phoneme tables.
+    """
+    wav_id = str(uuid.uuid4())
+    out = os.path.join(AUDIO_DIR, f"{wav_id}.wav")
+    lang = ESPEAK_MAP.get(voice_id, "en")
+
+    env = dict(os.environ)
+    env["ESPEAKNG_DATA"] = env.get("ESPEAKNG_DATA", DEFAULT_ESPEAK_DATA)
+
+    cmd = ["espeak-ng", "-v", lang, "-s", "165", "-w", out, "--", text]
+    subprocess.run(cmd, check=True, env=env)
+    return f"/audio/{wav_id}.wav"
+
+def synth_with_piper(text: str, voice_id: str) -> str:
+    """
+    High-quality TTS using Piper if a model file exists at /data/<voice_id>.onnx.
+    Otherwise falls back to espeak-ng.
+    """
+    model = f"/data/{voice_id}.onnx"
+    if os.path.exists(model):
+        wav_id = str(uuid.uuid4())
+        out = os.path.join(AUDIO_DIR, f"{wav_id}.wav")
+        cmd = ["piper", "--model", model, "--output_file", out]
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), check=True, timeout=60)
+            return f"/audio/{wav_id}.wav"
+        except Exception:
+            # Fall through to espeak if Piper fails
+            pass
+    return synth_with_espeak(text, voice_id)
+
+# --------------------
+# Helpers: Ollama
+# --------------------
+async def ollama_chat(model: str, msgs: List[Dict[str, str]]) -> str:
+    async with httpx.AsyncClient(timeout=60.0) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/chat", json={"model": model, "messages": msgs, "stream": False})
+        r.raise_for_status()
+        return r.json()["message"]["content"]
+
+async def ollama_generate(model: str, prompt: str, frame_b64: Optional[str]) -> str:
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    if frame_b64:
+        payload["images"] = [frame_b64]
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/generate", json=payload)
+        r.raise_for_status()
+        return r.json().get("response", "")
+
+# --------------------
+# Routes
+# --------------------
+@api.get("/health")
+async def health():
+    return {"ok": True}
+
+@api.get("/voices")
+async def voices(authorization: Optional[str] = Header(None)):
+    await require_api_key(authorization)
+    return {"voices": ADVERTISED_VOICES}
+
+@api.post("/profiles/{user_id}/settings")
+async def set_settings(user_id: str, body: VoiceSettings, authorization: Optional[str] = Header(None)):
+    await require_api_key(authorization)
+    USER_SETTINGS[user_id] = body.model_dump()
+    return {"ok": True, "user_id": user_id, "settings": USER_SETTINGS[user_id]}
+
+@api.get("/profiles/{user_id}/settings")
+async def get_settings(user_id: str, authorization: Optional[str] = Header(None)):
+    await require_api_key(authorization)
+    return USER_SETTINGS.get(user_id, {"voice_id": "en_US-amy-low", "speaking_rate": 1.0, "pitch": 0})
+
+@api.get("/audio/{fid}.wav")
+async def audio(fid: str):
+    p = os.path.join(AUDIO_DIR, f"{fid}.wav")
+    if not os.path.exists(p):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(p, media_type="audio/wav")
+
+@api.post("/speak")
+async def speak(body: SpeakBody, authorization: Optional[str] = Header(None)):
+    await require_api_key(authorization)
+    voice = body.voice_id or "en_US-amy-low"
+    url = synth_with_piper(body.text, voice)
+    return {"audio_url": url, "voice": voice}
+
+@api.post("/nlq")
+async def nlq(req: NLQRequest, authorization: Optional[str] = Header(None)):
+    await require_api_key(authorization)
+    # Vision summary (MoonDream via generate API)
+    vision = await ollama_generate(
+        "moondream",
+        f"Answer concisely. What about this frame helps with: {req.utterance}?",
+        req.frame_b64,
+    )
+    # Intent parse (Mistral via chat API)
+    sys_prompt = (
+        "You are a robotics intent parser. Given user utterance and visual observations, "
+        "emit strict JSON with fields: intent, target_object, area, count, confidence (0-1). "
+        "If unsure, use intent='clarify'. No extra text."
+    )
+    user = f"Utterance: {req.utterance}\nVisual: {vision}"
+    content = await ollama_chat("mistral", [{"role": "system", "content": sys_prompt},
+                                            {"role": "user", "content": user}])
+    try:
+        intent = json.loads(content)
+    except Exception:
+        intent = {"intent": "inform", "note": content, "confidence": 0.5}
+    return {"intent": intent, "visual_observation": vision}
+
+@api.post("/nav/goal")
+async def nav_goal(req: NavGoalRequest, authorization: Optional[str] = Header(None)):
+    await require_api_key(authorization)
+    # Demo waypoints; replace with your real planner
+    return {
+        "goal": req.goal,
+        "waypoints": [[0.5, 0.0, 0.0], [0.5, 1.0, 1.57], [0.5, 2.0, 1.57]],
+        "note": "demo path; replace with planner",
+    }

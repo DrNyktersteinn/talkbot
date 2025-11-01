@@ -1,0 +1,42 @@
+<<<<<<< HEAD
+# runtime & secrets
+runtime/
+gateway/api_keys.txt
+
+# generated audio / artifacts
+output/
+*.wav
+
+# local models / big binaries
+appdata/piper/
+*.onnx
+*.onnx.json
+
+# logs / temp / env
+__pycache__/
+*.pyc
+*.log
+uvicorn.log
+uvicorn.pid
+.DS_Store
+.vscode/
+.idea/
+.venv/
+=======
+runtime/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+.vscode/
+.idea/
+output/
+uvicorn.log
+uvicorn.pid
+>>>>>>> 3cbc8fe (Initial commit: My TalkBot deployment)
+appdata/piper/*.onnx
+appdata/piper/*.onnx
+appdata/piper/*.onnx
+runtime/
+downloads
+downloads.pub

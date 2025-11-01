@@ -1,0 +1,25 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports: ["11434:11434"]
+    environment: ["OLLAMA_KEEP_ALIVE=24h"]
+    volumes:
+      - ollama:/root/.ollama
+
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    depends_on: [ollama]
+    ports: ["8080:8080"]
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - API_KEYS_FILE=/app/api_keys.txt
+      - AUDIO_DIR=/app/audio
+    volumes:
+      - ./output:/app/audio
+      - ./appdata/piper:/data
+      - ./gateway/api_keys.txt:/app/api_keys.txt:ro
+
+volumes:
+  ollama: {}

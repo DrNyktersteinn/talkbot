@@ -1,0 +1,199 @@
+import os, uuid, glob, base64, shlex, subprocess, io, json
+from typing import Optional, List, Set, Dict, Any
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse, JSONResponse
+import httpx
+import os
+from pathlib import Path
+import logging
+
+# Base directory for writable data (audio/files/cache)
+BASE_DIR = os.environ.get("TALKBOT_DATA_DIR", str(Path.cwd() / "runtime"))
+AUDIO_DIR = str(Path(BASE_DIR) / "audio")
+UPLOAD_DIR = str(Path(BASE_DIR) / "uploads")
+CACHE_DIR = str(Path(BASE_DIR) / "cache")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+AUDIO_DIR   = os.getenv("AUDIO_DIR", AUDIO_DIR)
+API_KEYS_FN = os.getenv("API_KEYS_FILE", "/app/api_keys.txt")
+VOICES_DIR  = "/data"  # where .onnx models live
+OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://ollama:11434")
+CHAT_MODEL  = os.getenv("CHAT_MODEL",  "mistral:latest")
+VISION_MODEL= os.getenv("VISION_MODEL","moondream:latest")
+
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# -------- auth helpers --------
+def _load_keys() -> Set[str]:
+    keys: Set[str] = set()
+    try:
+        with open(API_KEYS_FN, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    keys.add(ln)
+    except FileNotFoundError:
+        pass
+    return keys
+
+def _require_key(authorization: Optional[str]) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    token = authorization.split(" ", 1)[1].strip()
+    keys = _load_keys()
+    if token not in keys:
+        raise HTTPException(status_code=403, detail=f"Invalid API key (loaded={len(keys)} from {API_KEYS_FN})")
+
+# -------- voice helpers --------
+def _voice_files() -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for p in glob.glob(os.path.join(VOICES_DIR, "*.onnx")):
+        vid = os.path.splitext(os.path.basename(p))[0]
+        out[vid] = p
+    return out
+
+def _pretty_name(voice_id: str) -> str:
+    # en_US-amy-medium -> en US / amy / medium
+    return voice_id.replace("_", " ").replace("-", " / ")
+
+# -------- TTS --------
+def synth_with_piper(text: str, voice_id: str) -> str:
+    models = _voice_files()
+    if voice_id not in models:
+        raise RuntimeError(f"Voice model not found for Piper: {voice_id}")
+    out_id  = f"{uuid.uuid4()}.wav"
+    out_fp  = os.path.join(AUDIO_DIR, out_id)
+    modelfp = models[voice_id]
+    # Piper static binary is on PATH (Dockerfile install)
+    cmd = f'piper -m {shlex.quote(modelfp)} -f {shlex.quote(out_fp)}'
+    proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate(text.encode("utf-8"), timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Piper failed: {stderr.decode('utf-8', errors='ignore')}")
+    return f"/audio/{out_id}"
+
+def synth_with_espeak(text: str, lang: str = "en-US", rate: int = 165) -> str:
+    out_id = f"{uuid.uuid4()}.wav"
+    out_fp = os.path.join(AUDIO_DIR, out_id)
+    cmd = f'espeak-ng -v {shlex.quote(lang)} -s {rate} -w {shlex.quote(out_fp)} -- {shlex.quote(text)}'
+    subprocess.run(cmd, shell=True, check=True)
+    return f"/audio/{out_id}"
+
+def speak(text: str, voice_id: str) -> str:
+    try:
+        # prefer Piper if model exists
+        if voice_id in _voice_files():
+            return synth_with_piper(text, voice_id)
+        # else try espeak with best-effort language from voice_id
+        lang = "en-US"
+        if voice_id.startswith("en_GB"): lang = "en-GB"
+        if voice_id.startswith("en_AU"): lang = "en-AU"
+        return synth_with_espeak(text, lang=lang)
+    except Exception as e:
+        # final fallback (no TTS available)
+        return ""
+
+# -------- Ollama helpers --------
+async def ollama_chat(model: str, messages: List[Dict[str, str]]) -> str:
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/chat", json={"model": model, "messages": messages, "stream": False})
+        r.raise_for_status()
+        j = r.json()
+        # v3
+        if "message" in j and isinstance(j["message"], dict):
+            return j["message"].get("content", "")
+        # v2-ish
+        if "choices" in j and j["choices"]:
+            return j["choices"][0]["message"]["content"]
+        # fallback
+        return j.get("response", "")
+
+async def ollama_generate(model: str, prompt: str, image_b64: Optional[str] = None) -> str:
+    payload: Dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
+    if image_b64:
+        payload["images"] = [image_b64]
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/generate", json=payload)
+        r.raise_for_status()
+        j = r.json()
+        return j.get("response", "")
+
+# -------- FastAPI --------
+api = FastAPI()
+log = logging.getLogger("talkbot.gateway")
+
+@api.get("/health")
+def health() -> Dict[str, bool]:
+    return {"ok": True}
+
+@api.get("/audio/{name}")
+def get_audio(name: str):
+    fp = os.path.join(AUDIO_DIR, name)
+    if not os.path.isfile(fp):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(fp, media_type="audio/wav")
+
+@api.get("/voices")
+def voices(authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    vids = sorted(_voice_files().keys())
+    # if you want to expose only friendly names to the GUI:
+    return {"voices": [{"id": vid, "name": _pretty_name(vid)} for vid in vids]}
+
+@api.post("/speak")
+def tts_endpoint(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    text = str(payload.get("text", "")).strip()
+    voice_id = str(payload.get("voice_id", "en_US-amy-medium"))
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+    url = speak(text, voice_id)
+    return {"audio_url": url, "voice": voice_id}
+
+@api.post("/chat")
+async def chat_endpoint(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    text = str(payload.get("text", "")).strip()
+    voice_id = str(payload.get("voice_id", "en_US-amy-medium"))
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+    # Mistral chat
+    sys_prompt = "You are a concise helpful assistant. Answer clearly."
+    assistant = await ollama_chat(CHAT_MODEL, [{"role":"system","content":sys_prompt},
+                                              {"role":"user","content":text}])
+    audio_url = speak(assistant, voice_id)
+    return {"text": assistant, "audio_url": audio_url, "voice": voice_id}
+
+@api.post("/vision")
+async def vision_endpoint(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    _require_key(authorization)
+    prompt   = str(payload.get("prompt", ""))
+    image_b64 = payload.get("image_b64")
+    voice_id = str(payload.get("voice_id", "en_US-amy-medium"))
+    if not image_b64:
+        raise HTTPException(status_code=400, detail="image_b64 is required")
+    q = f"""You are a navigation assistant. Describe the scene briefly and call out obstacles,
+    walkable directions, and any affordances. Be specific but concise."""
+    if prompt:
+        q = prompt + "\n\n" + q
+    result = await ollama_generate(VISION_MODEL, q, image_b64=image_b64)
+    audio_url = speak(result, voice_id)
+    return {"text": result, "audio_url": audio_url, "voice": voice_id}
+
+
+@api.get("/_authdebug")
+def authdebug(authorization: Optional[str] = Header(None)):
+    tok = ""
+    if authorization and authorization.startswith("Bearer "):
+        tok = authorization.split(" ", 1)[1].strip()
+    return {
+        "authorization": authorization,
+        "token_len": len(tok),
+        "token_prefix": tok[:8],
+        "token_suffix": tok[-8:],
+        "API_KEYS_FN": API_KEYS_FN,
+        "loaded_keys": len(_load_keys()),
+    }
+
