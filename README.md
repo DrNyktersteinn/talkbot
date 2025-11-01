@@ -26,14 +26,14 @@ FastAPI gateway on a Linux VM (with Ollama vision + chat models), plus a simple 
 * Python 3.10+ (we used 3.13 via Miniconda)
 * `pip` and `uvicorn`, `fastapi`, `httpx`
 * [Ollama](https://ollama.ai) running on the VM (defaults to `http://127.0.0.1:11434`)
-* Optional: `cloudflared` to expose your API over HTTPS
+*  `cloudflared` to expose your API over HTTPS
 
 ### Windows laptop (client)
 
 * Python 3.11+
 * Webcam + microphone
 * Packages: `PyQt6`, `requests`, `pyttsx3` (TTS), `opencv-python`
-* Optional STT: `SpeechRecognition`, `PyAudio`
+* STT: `SpeechRecognition`, `PyAudio`
 
 ---
 
